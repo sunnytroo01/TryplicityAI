@@ -300,8 +300,12 @@ def main():
     model.forward = make_checkpointed_forward(model)
 
     if args.compile:
-        print_main(rank, "\n  Compiling model...")
-        model = torch.compile(model)
+        print_main(rank, "\n  Compiling individual layers (compatible with grad checkpointing)...")
+        # Compile individual layers instead of whole model to avoid
+        # torch.compile + torch.utils.checkpoint conflict
+        for i, layer in enumerate(original_model.layers):
+            original_model.layers[i] = torch.compile(layer)
+        print_main(rank, f"  Compiled {len(original_model.layers)} transformer blocks")
 
     # Wrap in DDP for multi-GPU
     if world_size > 1:
@@ -405,7 +409,8 @@ def main():
                 )
 
             if args.compile:
-                model = torch.compile(model)
+                for i, layer in enumerate(original_model.layers):
+                    original_model.layers[i] = torch.compile(layer)
 
             # Re-wrap in DDP
             if world_size > 1:
