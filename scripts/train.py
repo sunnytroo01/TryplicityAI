@@ -207,7 +207,9 @@ def main():
     print("  Maximum Efficiency Edition")
     print("=" * 60)
     print(f"\n  GPU: {torch.cuda.get_device_name()}")
-    print(f"  VRAM: {torch.cuda.get_device_properties(0).total_mem / 1024**3:.1f} GB")
+    props = torch.cuda.get_device_properties(0)
+    vram = getattr(props, 'total_memory', getattr(props, 'total_mem', 0))
+    print(f"  VRAM: {vram / 1024**3:.1f} GB")
     print(f"  CUDA: {torch.version.cuda}")
 
     # Check for efficiency tools
@@ -403,7 +405,7 @@ def main():
             loss.backward()
             accum_loss += loss.item()
 
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+        grad_norm = torch.nn.utils.clip_grad_norm_(original_model.parameters(), config.grad_clip)
         optimizer.step()
 
         tokens_this_step = config.batch_size * current_accum * config.max_seq_len

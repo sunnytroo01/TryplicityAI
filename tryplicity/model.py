@@ -282,10 +282,12 @@ class Tryplicity(nn.Module):
 
             if top_p < 1.0:
                 sorted_logits, sorted_idx = torch.sort(logits, descending=True)
-                cumulative = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                remove = cumulative - F.softmax(sorted_logits, dim=-1) > top_p
+                probs_sorted = F.softmax(sorted_logits, dim=-1)
+                cumulative = torch.cumsum(probs_sorted, dim=-1)
+                remove = (cumulative - probs_sorted) > top_p
                 sorted_logits[remove] = float("-inf")
-                logits = sorted_logits.scatter(1, sorted_idx, sorted_logits)
+                logits = torch.zeros_like(logits)
+                logits.scatter_(1, sorted_idx, sorted_logits)
 
             probs = F.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)

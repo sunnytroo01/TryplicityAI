@@ -169,7 +169,7 @@ class Lion(Optimizer):
                     p.mul_(1.0 - group["lr"] * group["weight_decay"])
 
                 # Update: use sign of interpolation between gradient and momentum
-                update = exp_avg.mul(beta1).add(grad, alpha=1 - beta1)
+                update = exp_avg.clone().mul_(beta1).add_(grad, alpha=1 - beta1)
                 p.add_(update.sign_(), alpha=-group["lr"])
 
                 # Update momentum
