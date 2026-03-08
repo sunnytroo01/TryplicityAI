@@ -1,25 +1,23 @@
 """
-Tryplicity pre-training — maximum efficiency edition.
+Tryplicity pre-training — AMD MI300X edition.
 
-Supports: NVIDIA (CUDA) and AMD (ROCm) GPUs, single or multi-GPU via DDP.
+Hardcoded for: 5x AMD Instinct MI300X on RunPod via ROCm.
 
-  Single GPU:  python scripts/train.py --config configs/tryplicity_350m.json --compile
-  Multi-GPU:   torchrun --nproc_per_node=5 scripts/train.py --config configs/tryplicity_350m.json --compile
+  Launch: bash runpod/start_training.sh
+  (or)    torchrun --nproc_per_node=5 scripts/train.py --config configs/tryplicity_350m.json
 
-Every proven efficiency technique stacked together:
-
+Efficiency stack:
   OPTIMIZER:    AdEMAMix — 95% more token-efficient than AdamW (Apple, 2024)
   SCHEDULE:     WSD (Warmup-Stable-Decay) — from MiniCPM
   PROGRESSIVE:  G_stack — start at half depth, double midway (54% speedup)
-  KERNELS:      Liger Kernel — fused ops (20% throughput + 60% memory)
-  PRECISION:    BF16 mixed precision — 2x throughput
-  ATTENTION:    FlashAttention via SDPA — O(n) memory
-  MEMORY:       Gradient checkpointing — 70% less activation memory
-  COMPILATION:  torch.compile — automatic kernel fusion
+  KERNELS:      Liger Kernel — fused ops (works on AMD via Triton)
+  PRECISION:    BF16 mixed precision
+  ATTENTION:    FlashAttention via SDPA
+  MEMORY:       Gradient checkpointing
   STABILITY:    QK-Norm, Z-loss, embedding scaling
   LEARNING:     Multi-token prediction, batch size warmup
   DATA:         Sequence packing, pre-tokenized mmap shards
-  DISTRIBUTED:  DDP for multi-GPU scaling
+  DISTRIBUTED:  DDP (5 GPUs) via RCCL
 """
 
 import os
@@ -27,6 +25,7 @@ import sys
 import math
 import time
 import copy
+import traceback
 import argparse
 
 import torch
@@ -43,15 +42,16 @@ from tryplicity.optim import AdEMAMix
 
 
 # ---------------------------------------------------------------------------
-# Distributed helpers
+# Distributed helpers (RCCL on MI300X)
 # ---------------------------------------------------------------------------
 
 def setup_distributed():
-    """Initialize DDP if launched with torchrun."""
+    """Initialize DDP via RCCL (AMD's NCCL equivalent)."""
     if "RANK" not in os.environ:
-        return 0, 0, 1  # rank, local_rank, world_size (single GPU)
+        return 0, 0, 1  # single GPU fallback
 
     import torch.distributed as dist
+    # "nccl" maps to RCCL on ROCm — this is correct
     dist.init_process_group(backend="nccl")
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -71,21 +71,13 @@ def is_main(rank):
 
 
 def print_main(rank, *args, **kwargs):
-    """Only print on rank 0."""
     if is_main(rank):
-        print(*args, **kwargs)
+        print(*args, **kwargs, flush=True)
 
 
 # ---------------------------------------------------------------------------
 # Training utilities
 # ---------------------------------------------------------------------------
-
-def get_device_type():
-    """Detect CUDA (NVIDIA) or ROCm (AMD)."""
-    if torch.cuda.is_available():
-        return "cuda"
-    raise RuntimeError("No GPU found. Need CUDA (NVIDIA) or ROCm (AMD).")
-
 
 def get_lr(step: int, config: TryplicityConfig) -> float:
     """WSD schedule — Warmup-Stable-Decay (MiniCPM)."""
@@ -103,7 +95,6 @@ def save_checkpoint(model, optimizer, step, loss, config, path, rank=0):
     if not is_main(rank):
         return
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    # Unwrap DDP if needed
     state_dict = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
     torch.save({
         "step": step,
@@ -112,12 +103,11 @@ def save_checkpoint(model, optimizer, step, loss, config, path, rank=0):
         "loss": loss,
         "config": {k: v for k, v in config.__dict__.items()},
     }, path)
-    print(f"  Saved: {path}")
+    print(f"  Saved: {path}", flush=True)
 
 
 def load_checkpoint(path, model, optimizer=None):
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    # Handle DDP-wrapped models
     target = model.module if hasattr(model, "module") else model
     target.load_state_dict(ckpt["model_state_dict"])
     if optimizer and "optimizer_state_dict" in ckpt:
@@ -130,7 +120,7 @@ def g_stack(model, config):
     print("\n" + "=" * 60)
     print("  G_STACK: Doubling model depth")
     print(f"  {config.n_layers // 2} layers -> {config.n_layers} layers")
-    print("=" * 60)
+    print("=" * 60, flush=True)
 
     old_layers = list(model.layers)
     new_layers = nn.ModuleList()
@@ -147,12 +137,12 @@ def g_stack(model, config):
     model.layers = new_layers
     new_params = sum(p.numel() for p in model.parameters())
     print(f"  New parameter count: {new_params:,} ({new_params/1e6:.1f}M)")
-    print(f"  Layers: {len(model.layers)}")
+    print(f"  Layers: {len(model.layers)}", flush=True)
     return model
 
 
 def setup_liger_kernel():
-    """Try to use Liger Kernel for fused operations."""
+    """Try to use Liger Kernel (works on AMD via Triton)."""
     try:
         from liger_kernel.transformers import (
             LigerRMSNorm,
@@ -176,8 +166,8 @@ def evaluate(model, val_loader, device, max_batches=50):
         if i >= max_batches:
             break
         x, y = x.to(device), y.to(device)
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            # Handle DDP wrapper
+        # cache_enabled=False prevents checkpoint + autocast bug
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, cache_enabled=False):
             m = model.module if hasattr(model, "module") else model
             _, loss = m(x, y)
         total_loss += loss.item()
@@ -191,15 +181,14 @@ def evaluate(model, val_loader, device, max_batches=50):
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Train Tryplicity")
+    parser = argparse.ArgumentParser(description="Train Tryplicity (MI300X)")
     parser.add_argument("--config", type=str, default=None)
     parser.add_argument("--resume", type=str, default=None)
-    parser.add_argument("--compile", action="store_true", help="torch.compile")
     parser.add_argument("--no-progressive", action="store_true")
     parser.add_argument("--optimizer", type=str, default="ademamix", choices=["ademamix", "adamw"])
     args = parser.parse_args()
 
-    # Distributed setup
+    # Distributed setup (RCCL)
     rank, local_rank, world_size = setup_distributed()
     device = torch.device("cuda", local_rank)
 
@@ -207,35 +196,31 @@ def main():
     torch.manual_seed(config.seed)
     torch.cuda.manual_seed(config.seed)
 
-    # Enable TF32 for NVIDIA Ampere+ (harmless no-op on AMD)
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-
     # GPU info
     gpu_name = torch.cuda.get_device_name(local_rank)
     props = torch.cuda.get_device_properties(local_rank)
     vram = getattr(props, 'total_memory', getattr(props, 'total_mem', 0))
-    is_amd = "mi" in gpu_name.lower() or "instinct" in gpu_name.lower() or "radeon" in gpu_name.lower()
 
     print_main(rank, "=" * 60)
     print_main(rank, "  TRYPLICITY PRE-TRAINING")
-    print_main(rank, "  Maximum Efficiency Edition")
+    print_main(rank, "  AMD MI300X Edition")
     print_main(rank, "=" * 60)
     print_main(rank, f"\n  GPU: {gpu_name} x{world_size}")
     print_main(rank, f"  VRAM: {vram / 1024**3:.1f} GB per GPU ({vram * world_size / 1024**3:.1f} GB total)")
-    print_main(rank, f"  Backend: {'ROCm (AMD)' if is_amd else 'CUDA (NVIDIA)'}")
-    if not is_amd:
-        print_main(rank, f"  CUDA: {torch.version.cuda}")
+    print_main(rank, f"  Backend: ROCm (RCCL)")
+    print_main(rank, f"  PyTorch: {torch.__version__}")
+    if hasattr(torch.version, 'hip'):
+        print_main(rank, f"  HIP/ROCm: {torch.version.hip}")
 
     # Efficiency stack
     liger = setup_liger_kernel()
     print_main(rank, "\n  Efficiency stack:")
-    print_main(rank, f"  Liger Kernel: {'ENABLED' if liger.get('available') else 'not installed'}")
-    print_main(rank, f"  FlashAttention (SDPA): YES")
-    print_main(rank, f"  BF16 mixed precision: YES")
-    print_main(rank, f"  Gradient checkpointing: YES")
-    print_main(rank, f"  torch.compile: {'YES' if args.compile else 'NO'}")
-    print_main(rank, f"  DDP multi-GPU: {'YES (' + str(world_size) + ' GPUs)' if world_size > 1 else 'NO (single GPU)'}")
+    print_main(rank, f"    Liger Kernel: {'YES' if liger.get('available') else 'not installed (pip install liger-kernel)'}")
+    print_main(rank, f"    FlashAttention (SDPA): YES")
+    print_main(rank, f"    BF16 mixed precision: YES")
+    print_main(rank, f"    Gradient checkpointing: YES")
+    print_main(rank, f"    torch.compile: NO (not stable on ROCm)")
+    print_main(rank, f"    DDP multi-GPU: {'YES (' + str(world_size) + ' GPUs)' if world_size > 1 else 'NO (single GPU)'}")
 
     # Progressive training: start at half depth
     use_progressive = not args.no_progressive
@@ -251,7 +236,6 @@ def main():
         stack_step = None
 
     n_params = model.num_parameters()
-    # Scale effective batch by world_size for multi-GPU
     eff_batch = config.batch_size * config.gradient_accumulation_steps * config.max_seq_len * world_size
     print_main(rank, f"\n  Model: {n_params:,} params ({n_params/1e6:.1f}M)")
     print_main(rank, f"  Architecture: {len(model.layers)}L, {config.n_heads}H, dim={config.dim}")
@@ -299,25 +283,13 @@ def main():
 
     model.forward = make_checkpointed_forward(model)
 
-    # Auto-disable torch.compile on AMD — ROCm support is unreliable
-    if args.compile and is_amd:
-        print_main(rank, "\n  WARNING: torch.compile disabled — not stable on AMD ROCm GPUs")
-        args.compile = False
-
-    if args.compile:
-        print_main(rank, "\n  Compiling individual layers (compatible with grad checkpointing)...")
-        for i, layer in enumerate(original_model.layers):
-            original_model.layers[i] = torch.compile(layer)
-        print_main(rank, f"  Compiled {len(original_model.layers)} transformer blocks")
-
-    # Wrap in DDP for multi-GPU
+    # Wrap in DDP with static_graph=True for gradient checkpointing compatibility
     if world_size > 1:
         from torch.nn.parallel import DistributedDataParallel as DDP
-        model = DDP(model, device_ids=[local_rank])
-        print_main(rank, f"  DDP initialized on {world_size} GPUs")
+        model = DDP(model, device_ids=[local_rank], static_graph=True)
+        print_main(rank, f"  DDP initialized on {world_size} GPUs (static_graph=True)")
 
-    # Optimizer
-    # Use original_model.parameters() to avoid DDP wrapper issues
+    # Optimizer (no fused=True on AMD)
     if args.optimizer == "ademamix":
         print_main(rank, f"\n  Optimizer: AdEMAMix (95% more token-efficient than AdamW)")
         optimizer = AdEMAMix(
@@ -330,14 +302,11 @@ def main():
         )
     else:
         print_main(rank, f"\n  Optimizer: AdamW")
-        # fused=True only works on NVIDIA
-        use_fused = not is_amd
         optimizer = torch.optim.AdamW(
             original_model.parameters(),
             lr=config.learning_rate,
             betas=(0.9, 0.95),
             weight_decay=config.weight_decay,
-            fused=use_fused,
         )
 
     # Resume
@@ -351,7 +320,7 @@ def main():
     train_dataset = PackedDataset(config.data_dir, seq_len=config.max_seq_len, split="train")
     val_dataset = PackedDataset(config.data_dir, seq_len=config.max_seq_len, split="val")
 
-    # Use DistributedSampler for multi-GPU
+    # DistributedSampler for multi-GPU
     train_sampler = None
     val_sampler = None
     if world_size > 1:
@@ -391,7 +360,6 @@ def main():
 
         # G_stack: double depth at midpoint
         if use_progressive and not stacked and step >= stack_step:
-            # Unwrap DDP before modifying architecture
             original_model = g_stack(original_model, config)
             original_model = original_model.to(device)
             model = original_model
@@ -408,17 +376,12 @@ def main():
                 optimizer = torch.optim.AdamW(
                     original_model.parameters(), lr=config.learning_rate,
                     betas=(0.9, 0.95), weight_decay=config.weight_decay,
-                    fused=(not is_amd),
                 )
-
-            if args.compile and not is_amd:
-                for i, layer in enumerate(original_model.layers):
-                    original_model.layers[i] = torch.compile(layer)
 
             # Re-wrap in DDP
             if world_size > 1:
                 from torch.nn.parallel import DistributedDataParallel as DDP
-                model = DDP(model, device_ids=[local_rank])
+                model = DDP(model, device_ids=[local_rank], static_graph=True)
 
             stacked = True
             n_params = original_model.num_parameters()
@@ -449,7 +412,9 @@ def main():
 
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            # cache_enabled=False prevents known bug with checkpoint + autocast
+            # (PyTorch issue #141896)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, cache_enabled=False):
                 _, loss = model(x, y)
                 loss = loss / current_accum
 
@@ -512,4 +477,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        # Print full traceback so torchrun actually shows the error
+        print(f"\n{'='*60}", flush=True)
+        print(f"FATAL ERROR on rank {os.environ.get('LOCAL_RANK', '?')}:", flush=True)
+        traceback.print_exc()
+        print(f"{'='*60}", flush=True)
+        sys.exit(1)
