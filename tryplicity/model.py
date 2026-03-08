@@ -1,12 +1,25 @@
 """
 Tryplicity — a decoder-only transformer built from scratch.
 
-Architecture follows modern best practices:
+Architecture:
   - RMSNorm (pre-norm)
   - Rotary Position Embeddings (RoPE)
-  - Grouped Query Attention (GQA)
+  - Grouped Query Attention (GQA) with QK-Norm
   - SwiGLU feed-forward
+  - Multi-token prediction (auxiliary heads)
+  - Z-loss for logit stability
+  - Embedding gradient scaling (muP-lite)
   - No bias terms
+
+Efficiency additions (Tier 2):
+  - QK-Norm: normalizes Q and K before attention, allowing higher LR
+    and preventing attention logit growth. Used by Cohere, Gemma 2.
+  - Multi-token prediction: predict 2-4 future tokens simultaneously.
+    Each forward pass extracts 2-4x more learning signal. (Meta, 2024)
+  - Z-loss: small penalty on logit magnitude prevents FP16 overflow
+    and improves training stability. (PaLM, Google)
+  - Embedding scaling: scale embeddings by sqrt(dim) for muP-like
+    behavior — better gradient flow to embeddings. (GPT-NeoX)
 """
 
 import math
@@ -36,16 +49,13 @@ def precompute_rope(dim: int, max_seq_len: int, theta: float = 10000.0) -> Tuple
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
     t = torch.arange(max_seq_len).float()
     freqs = torch.outer(t, freqs)
-    cos = freqs.cos()
-    sin = freqs.sin()
-    return cos, sin
+    return freqs.cos(), freqs.sin()
 
 
 def apply_rope(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Apply rotary position embeddings to queries and keys."""
-    # q, k: (batch, n_heads, seq_len, head_dim)
     seq_len = q.shape[2]
-    cos = cos[:seq_len].unsqueeze(0).unsqueeze(0)  # (1, 1, seq, head_dim//2)
+    cos = cos[:seq_len].unsqueeze(0).unsqueeze(0)
     sin = sin[:seq_len].unsqueeze(0).unsqueeze(0)
 
     def rotate(x):
@@ -59,7 +69,15 @@ def apply_rope(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.T
 
 
 class GQAttention(nn.Module):
-    """Grouped Query Attention — fewer KV heads than query heads."""
+    """Grouped Query Attention with QK-Norm.
+
+    QK-Norm (Dehghani et al., 2023): Apply RMSNorm to Q and K vectors
+    before computing attention scores. This prevents attention logit
+    growth as training progresses, which:
+      - Allows 2-3x higher learning rates without instability
+      - Prevents attention entropy collapse
+      - Used by Cohere Command R, Gemma 2, Chameleon
+    """
 
     def __init__(self, config: TryplicityConfig):
         super().__init__()
@@ -72,6 +90,11 @@ class GQAttention(nn.Module):
         self.k_proj = nn.Linear(config.dim, config.n_kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(config.dim, config.n_kv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(config.n_heads * self.head_dim, config.dim, bias=False)
+
+        # QK-Norm: normalize queries and keys per-head
+        self.q_norm = RMSNorm(self.head_dim, config.norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, config.norm_eps)
+
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -81,29 +104,24 @@ class GQAttention(nn.Module):
         k = self.k_proj(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
 
-        # Apply RoPE
+        # QK-Norm: normalize before RoPE
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        # Apply RoPE after normalization
         q, k = apply_rope(q, k, cos, sin)
 
-        # Expand KV heads to match query heads (GQA)
+        # Expand KV heads for GQA
         if self.n_rep > 1:
             k = k.repeat_interleave(self.n_rep, dim=1)
             v = v.repeat_interleave(self.n_rep, dim=1)
 
-        # Try to use flash attention if available
-        try:
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=(mask is None), dropout_p=self.dropout.p if self.training else 0.0)
-        except RuntimeError:
-            # Fallback to manual attention
-            scale = 1.0 / math.sqrt(self.head_dim)
-            attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-            if mask is not None:
-                attn = attn + mask
-            else:
-                causal = torch.triu(torch.full((T, T), float("-inf"), device=x.device), diagonal=1)
-                attn = attn + causal
-            attn = F.softmax(attn, dim=-1)
-            attn = self.dropout(attn)
-            out = torch.matmul(attn, v)
+        # FlashAttention via SDPA
+        out = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=mask,
+            is_causal=(mask is None),
+            dropout_p=self.dropout.p if self.training else 0.0,
+        )
 
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.o_proj(out)
@@ -139,6 +157,28 @@ class TransformerBlock(nn.Module):
         return x
 
 
+class MultiTokenPredictionHead(nn.Module):
+    """Auxiliary head that predicts N future tokens simultaneously.
+
+    From Meta (Gloeckle et al., 2024): Training with multi-token prediction
+    extracts 2-4x more learning signal per forward pass. The model learns
+    not just the next token but the next 2-4 tokens, forcing deeper
+    understanding of text structure.
+
+    Only the standard next-token head is used at inference.
+    This is a pure training efficiency technique.
+    """
+
+    def __init__(self, config: TryplicityConfig):
+        super().__init__()
+        # Each auxiliary head has its own lightweight projection
+        self.norm = RMSNorm(config.dim, config.norm_eps)
+        self.proj = nn.Linear(config.dim, config.vocab_size, bias=False)
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        return self.proj(self.norm(hidden))
+
+
 class Tryplicity(nn.Module):
     """The Tryplicity language model."""
 
@@ -151,26 +191,37 @@ class Tryplicity(nn.Module):
         self.norm = RMSNorm(config.dim, config.norm_eps)
         self.lm_head = nn.Linear(config.dim, config.vocab_size, bias=False)
 
-        # Weight tying: share embedding and output weights
+        # Weight tying
         self.lm_head.weight = self.tok_emb.weight
 
-        # Precompute RoPE tables
+        # Multi-token prediction: 3 auxiliary heads (predict tokens +2, +3, +4)
+        self.n_future_tokens = config.n_future_tokens
+        if self.n_future_tokens > 1:
+            self.aux_heads = nn.ModuleList([
+                MultiTokenPredictionHead(config)
+                for _ in range(self.n_future_tokens - 1)
+            ])
+        else:
+            self.aux_heads = None
+
+        # Precompute RoPE
         cos, sin = precompute_rope(config.head_dim, config.max_seq_len, config.rope_theta)
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)
 
-        # Initialize weights
+        # Embedding scaling factor (muP-lite)
+        self.emb_scale = math.sqrt(config.dim)
+
         self._init_weights()
 
     def _init_weights(self):
-        """Initialize with small weights for stable training."""
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.normal_(module.weight, mean=0.0, std=0.02)
             elif isinstance(module, nn.Embedding):
                 nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-        # Scale residual projections by 1/sqrt(2*n_layers) for stability
+        # Scale residual projections
         scale = (2 * self.config.n_layers) ** -0.5
         for layer in self.layers:
             nn.init.normal_(layer.attn.o_proj.weight, mean=0.0, std=0.02 * scale)
@@ -178,7 +229,9 @@ class Tryplicity(nn.Module):
 
     def forward(self, input_ids: torch.Tensor, targets: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         B, T = input_ids.shape
-        x = self.tok_emb(input_ids)
+
+        # Embedding with muP-like scaling
+        x = self.tok_emb(input_ids) * self.emb_scale
 
         for layer in self.layers:
             x = layer(x, self.rope_cos, self.rope_sin)
@@ -188,7 +241,29 @@ class Tryplicity(nn.Module):
 
         loss = None
         if targets is not None:
+            # Primary next-token loss
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+
+            # Z-loss: penalize large logits for numerical stability (PaLM)
+            # Prevents FP16/BF16 overflow and encourages sharper distributions
+            z_loss = 1e-4 * logits.float().logsumexp(dim=-1).pow(2).mean()
+            loss = loss + z_loss
+
+            # Multi-token prediction auxiliary losses
+            if self.aux_heads is not None and T > self.n_future_tokens:
+                for i, head in enumerate(self.aux_heads):
+                    offset = i + 2  # head 0 predicts +2, head 1 predicts +3, etc.
+                    if offset < T:
+                        aux_logits = head(x[:, :-offset, :])
+                        aux_targets = targets[:, offset:]
+                        min_len = min(aux_logits.shape[1], aux_targets.shape[1])
+                        aux_loss = F.cross_entropy(
+                            aux_logits[:, :min_len].reshape(-1, aux_logits.size(-1)),
+                            aux_targets[:, :min_len].reshape(-1),
+                            ignore_index=-1,
+                        )
+                        # Auxiliary losses weighted lower (0.1 each)
+                        loss = loss + 0.1 * aux_loss
 
         return logits, loss
 
@@ -201,12 +276,10 @@ class Tryplicity(nn.Module):
             logits, _ = self(idx)
             logits = logits[:, -1, :] / temperature
 
-            # Top-k filtering
             if top_k > 0:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = float("-inf")
 
-            # Top-p (nucleus) filtering
             if top_p < 1.0:
                 sorted_logits, sorted_idx = torch.sort(logits, descending=True)
                 cumulative = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)

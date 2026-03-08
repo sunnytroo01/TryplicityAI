@@ -31,6 +31,15 @@ Every proven efficiency technique stacked together:
   COMPILATION:
     torch.compile — automatic kernel fusion and optimization
 
+  STABILITY:
+    QK-Norm — normalized Q/K prevents attention logit growth (Cohere, Gemma 2)
+    Z-loss — logit magnitude penalty prevents BF16 overflow (PaLM, Google)
+    Embedding scaling — muP-lite gradient flow to embeddings (GPT-NeoX)
+
+  LEARNING SIGNAL:
+    Multi-token prediction — predict 2-4 future tokens per step (Meta, 2024)
+    Batch size warmup — start small, ramp to full over warmup period
+
   DATA:
     Sequence packing — zero padding waste (1.7-3x speedup)
     Pre-tokenized binary shards — zero-copy mmap loading
@@ -235,7 +244,8 @@ def main():
     def make_checkpointed_forward(m):
         def forward(input_ids, targets=None):
             B, T = input_ids.shape
-            x = m.tok_emb(input_ids)
+            # Embedding with muP-like scaling
+            x = m.tok_emb(input_ids) * m.emb_scale
             for layer in m.layers:
                 x = torch.utils.checkpoint.checkpoint(
                     layer, x, m.rope_cos, m.rope_sin, None,
@@ -250,6 +260,23 @@ def main():
                     loss = loss_fn(logits.view(-1, logits.size(-1)), targets.view(-1))
                 else:
                     loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+                # Z-loss: penalize large logits for BF16 stability (PaLM)
+                z_loss = 1e-4 * logits.float().logsumexp(dim=-1).pow(2).mean()
+                loss = loss + z_loss
+                # Multi-token prediction auxiliary losses
+                if m.aux_heads is not None and T > m.n_future_tokens:
+                    for i, head in enumerate(m.aux_heads):
+                        offset = i + 2
+                        if offset < T:
+                            aux_logits = head(x[:, :-offset, :])
+                            aux_targets = targets[:, offset:]
+                            min_len = min(aux_logits.shape[1], aux_targets.shape[1])
+                            aux_loss = F.cross_entropy(
+                                aux_logits[:, :min_len].reshape(-1, aux_logits.size(-1)),
+                                aux_targets[:, :min_len].reshape(-1),
+                                ignore_index=-1,
+                            )
+                            loss = loss + 0.1 * aux_loss
             return logits, loss
         return forward
 
@@ -347,11 +374,20 @@ def main():
         for pg in optimizer.param_groups:
             pg["lr"] = lr
 
+        # Batch size warmup: ramp gradient accumulation from 1/4 to full
+        # over warmup period. Smaller batches early = more updates = faster
+        # initial learning. Larger batches later = more stable convergence.
+        if step < config.warmup_steps:
+            warmup_frac = max(0.25, step / config.warmup_steps)
+            current_accum = max(1, int(config.gradient_accumulation_steps * warmup_frac))
+        else:
+            current_accum = config.gradient_accumulation_steps
+
         # Gradient accumulation
         optimizer.zero_grad(set_to_none=True)
         accum_loss = 0.0
 
-        for _ in range(config.gradient_accumulation_steps):
+        for _ in range(current_accum):
             try:
                 x, y = next(train_iter)
             except StopIteration:
@@ -362,7 +398,7 @@ def main():
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 _, loss = model(x, y)
-                loss = loss / config.gradient_accumulation_steps
+                loss = loss / current_accum
 
             loss.backward()
             accum_loss += loss.item()
@@ -370,7 +406,7 @@ def main():
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
         optimizer.step()
 
-        tokens_this_step = config.batch_size * config.gradient_accumulation_steps * config.max_seq_len
+        tokens_this_step = config.batch_size * current_accum * config.max_seq_len
         tokens_processed += tokens_this_step
         running_loss += accum_loss
 

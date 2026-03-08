@@ -17,6 +17,10 @@ class TryplicityConfig:
     rope_theta: float = 10000.0
     dropout: float = 0.0
 
+    # Efficiency: multi-token prediction (Meta, 2024)
+    # Predict N future tokens simultaneously for 1.5-2x more learning signal
+    n_future_tokens: int = 4  # 1 = standard next-token only, 4 = predict +1,+2,+3,+4
+
     # Training
     batch_size: int = 64
     gradient_accumulation_steps: int = 8  # effective batch = 64 * 8 * 2048 = ~1M tokens
