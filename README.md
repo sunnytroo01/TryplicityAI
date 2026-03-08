@@ -40,12 +40,12 @@ Tying:       Embedding = LM head (saves ~32M params)
 
 ## Training Data
 
-High-quality open data, deduplicated and quality-filtered:
-- **90%** FineWeb-Edu -- curated educational web text
-- **10%** StarCoderData -- Python source code
-- **Total:** ~20B tokens
+**100% English Wikipedia** (pre-2022 snapshot, 20220301 dump):
+- **6.5M+ articles** covering every domain of human knowledge
+- **~4B tokens** of high-quality encyclopedic text
 - **Dedup:** Near-duplicate removal via MinHash shingling
 - **Filter:** Quality heuristics (length, alpha ratio, repetition)
+- **Packing:** Documents concatenated with EOS separators, zero padding waste
 
 ## Custom Optimizer: AdEMAMix
 

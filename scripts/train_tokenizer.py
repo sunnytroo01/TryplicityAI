@@ -1,5 +1,5 @@
 """
-Train a 32K BPE tokenizer from scratch on FineWeb-Edu samples.
+Train a 32K BPE tokenizer from scratch on Wikipedia samples.
 
 Uses SentencePiece — the same approach as Llama and Mistral.
 Run this FIRST before processing training data.
@@ -12,13 +12,13 @@ from pathlib import Path
 
 
 def download_sample_text(output_path: str, target_mb: int = 500):
-    """Download raw text samples for tokenizer training."""
+    """Download raw Wikipedia text samples for tokenizer training."""
     from datasets import load_dataset
 
-    print(f"Downloading ~{target_mb}MB of text for tokenizer training...")
+    print(f"Downloading ~{target_mb}MB of Wikipedia text for tokenizer training...")
     ds = load_dataset(
-        "HuggingFaceFW/fineweb-edu",
-        name="sample-10BT",
+        "wikipedia",
+        "20220301.en",
         split="train",
         streaming=True,
     )
@@ -27,16 +27,17 @@ def download_sample_text(output_path: str, target_mb: int = 500):
     target_bytes = target_mb * 1024 * 1024
 
     with open(output_path, "w", encoding="utf-8") as f:
-        for example in ds:
-            text = example.get("text", "")
+        for article in ds:
+            title = article.get("title", "")
+            text = article.get("text", "")
             if not text or len(text) < 100:
                 continue
-            f.write(text + "\n")
+            f.write(f"{title}\n\n{text}\n")
             written += len(text.encode("utf-8"))
             if written >= target_bytes:
                 break
 
-    print(f"Wrote {written / 1024 / 1024:.1f}MB of training text")
+    print(f"Wrote {written / 1024 / 1024:.1f}MB of Wikipedia text")
 
 
 def train_tokenizer(input_path: str, output_dir: str, vocab_size: int = 32000):

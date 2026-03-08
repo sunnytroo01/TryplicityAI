@@ -1,12 +1,16 @@
 """
 Data pipeline for Tryplicity pre-training.
 
+Data source: English Wikipedia (pre-2022 snapshot)
+  - 6.5M+ articles, ~4B tokens after tokenization
+  - High-quality, encyclopedic knowledge across all domains
+  - No code, no social media noise — pure knowledge
+
 Efficiency techniques applied:
   1. Sequence packing — zero padding waste (1.7-3x speedup)
-  2. SemDeDup — semantic deduplication removes 50% redundant data
-  3. Quality filtering — perplexity-based data pruning
+  2. Near-deduplication — MinHash shingling removes redundant content
+  3. Quality filtering — heuristic data pruning
   4. Memory-mapped binary shards — zero-copy data loading
-  5. Multi-stage curriculum — web data first, high-quality second
 """
 
 import os
@@ -125,8 +129,12 @@ class DataPipeline:
         combined = '|'.join(sorted(shingles[:10]))
         return hashlib.md5(combined.encode()).hexdigest()
 
-    def process_fineweb_edu(self, num_tokens: int = 20_000_000_000):
-        """Download and tokenize FineWeb-Edu with dedup + quality filter."""
+    def process_wikipedia(self, num_tokens: int = 20_000_000_000):
+        """Download and tokenize all of English Wikipedia (pre-2022 snapshot).
+
+        Uses the 20220301.en dump — the full English Wikipedia as of March 2022.
+        This contains 6.5M+ articles covering every domain of human knowledge.
+        """
         from datasets import load_dataset
         import sentencepiece as spm
 
@@ -138,11 +146,14 @@ class DataPipeline:
         os.makedirs(train_dir, exist_ok=True)
         os.makedirs(val_dir, exist_ok=True)
 
-        print(f"Streaming FineWeb-Edu | target: {num_tokens:,} tokens")
+        print(f"Loading English Wikipedia (20220301 snapshot)")
+        print(f"  Target: {num_tokens:,} tokens")
         print(f"  Quality filter: ON | Dedup: ON | Packing: ON")
+
+        # Full English Wikipedia — pre-2022 snapshot
         ds = load_dataset(
-            "HuggingFaceFW/fineweb-edu",
-            name="sample-10BT",
+            "wikipedia",
+            "20220301.en",
             split="train",
             streaming=True,
         )
@@ -151,12 +162,13 @@ class DataPipeline:
         token_buf = []
         total_tokens = 0
         val_tokens_written = 0
-        val_target = num_tokens // 50
+        val_target = num_tokens // 50  # 2% for validation
         seen_hashes = set()
         stats = {"total": 0, "filtered": 0, "deduped": 0, "kept": 0}
 
-        for example in ds:
-            text = example.get("text", "")
+        for article in ds:
+            title = article.get("title", "")
+            text = article.get("text", "")
             stats["total"] += 1
 
             # Quality filter
@@ -164,21 +176,21 @@ class DataPipeline:
                 stats["filtered"] += 1
                 continue
 
-            # Near-dedup
+            # Near-dedup (some Wikipedia articles are near-duplicates)
             doc_hash = self._dedup_hash(text)
             if doc_hash in seen_hashes:
                 stats["deduped"] += 1
                 continue
             seen_hashes.add(doc_hash)
-            # Cap hash set memory (keep most recent)
-            if len(seen_hashes) > 5_000_000:
-                seen_hashes = set(list(seen_hashes)[-2_500_000:])
+            if len(seen_hashes) > 10_000_000:
+                seen_hashes = set(list(seen_hashes)[-5_000_000:])
 
             stats["kept"] += 1
 
-            # Tokenize and pack with EOS separator
-            tokens = sp.encode(text, out_type=int)
-            tokens.append(eos_id)  # Document boundary for sequence packing
+            # Tokenize with article title as context
+            full_text = f"{title}\n\n{text}" if title else text
+            tokens = sp.encode(full_text, out_type=int)
+            tokens.append(eos_id)  # Document boundary
             token_buf.extend(tokens)
 
             while len(token_buf) >= self.SHARD_SIZE:
@@ -195,72 +207,20 @@ class DataPipeline:
                 shard_idx += 1
                 total_tokens += len(shard_tokens)
                 keep_rate = stats["kept"] / max(stats["total"], 1) * 100
-                print(f"  Shard {shard_idx}: {total_tokens:,} tokens | {keep_rate:.0f}% kept")
+                print(f"  Shard {shard_idx}: {total_tokens:,} tokens | {keep_rate:.0f}% kept | {stats['kept']:,} articles")
 
             if total_tokens >= num_tokens:
                 break
 
+        # Write remaining tokens
         if token_buf:
             shard_tokens = np.array(token_buf, dtype=np.uint16)
             path = os.path.join(train_dir, f"shard_{shard_idx:05d}.bin")
             shard_tokens.tofile(path)
             total_tokens += len(shard_tokens)
 
-        print(f"\nFineWeb-Edu complete: {total_tokens:,} tokens")
-        print(f"  Processed: {stats['total']:,} docs")
+        print(f"\nWikipedia complete: {total_tokens:,} tokens")
+        print(f"  Articles processed: {stats['total']:,}")
         print(f"  Filtered (quality): {stats['filtered']:,}")
         print(f"  Deduped: {stats['deduped']:,}")
         print(f"  Kept: {stats['kept']:,} ({stats['kept']/max(stats['total'],1)*100:.1f}%)")
-
-    def process_code_data(self, num_tokens: int = 2_000_000_000):
-        """Download and tokenize StarCoder data with quality filter."""
-        from datasets import load_dataset
-        import sentencepiece as spm
-
-        sp = spm.SentencePieceProcessor(model_file=self.tokenizer_path)
-        eos_id = sp.eos_id()
-
-        train_dir = os.path.join(self.output_dir, "train")
-        os.makedirs(train_dir, exist_ok=True)
-
-        print(f"Streaming StarCoder data | target: {num_tokens:,} tokens")
-        ds = load_dataset(
-            "bigcode/starcoderdata",
-            data_dir="python",
-            split="train",
-            streaming=True,
-        )
-
-        existing = list(Path(train_dir).glob("*.bin"))
-        shard_idx = len(existing)
-        token_buf = []
-        total_tokens = 0
-
-        for example in ds:
-            text = example.get("content", "")
-            if not text or len(text) < 50:
-                continue
-
-            tokens = sp.encode(text, out_type=int)
-            tokens.append(eos_id)
-            token_buf.extend(tokens)
-
-            while len(token_buf) >= self.SHARD_SIZE:
-                shard_tokens = np.array(token_buf[:self.SHARD_SIZE], dtype=np.uint16)
-                token_buf = token_buf[self.SHARD_SIZE:]
-                path = os.path.join(train_dir, f"shard_{shard_idx:05d}.bin")
-                shard_tokens.tofile(path)
-                shard_idx += 1
-                total_tokens += len(shard_tokens)
-                print(f"  Code shard {shard_idx}: {total_tokens:,} tokens")
-
-            if total_tokens >= num_tokens:
-                break
-
-        if token_buf:
-            shard_tokens = np.array(token_buf, dtype=np.uint16)
-            path = os.path.join(train_dir, f"shard_{shard_idx:05d}.bin")
-            shard_tokens.tofile(path)
-            total_tokens += len(shard_tokens)
-
-        print(f"Code data complete: {total_tokens:,} tokens")

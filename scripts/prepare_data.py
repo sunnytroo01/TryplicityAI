@@ -1,9 +1,10 @@
 """
-Download and tokenize all training data into binary shards.
+Download and tokenize all of English Wikipedia (pre-2022) into binary shards.
 
-Data mix (following SmolLM2 recipe):
-  - 90% FineWeb-Edu (high-quality web text)
-  - 10% StarCoderData (Python code)
+Data source:
+  - 100% English Wikipedia (20220301 snapshot)
+  - 6.5M+ articles, ~4B tokens
+  - Full encyclopedic knowledge across all domains
 
 Run AFTER train_tokenizer.py.
 """
@@ -22,8 +23,6 @@ def main():
     parser.add_argument("--tokenizer", type=str, default="/workspace/tokenizer/tryplicity.model")
     parser.add_argument("--total-tokens", type=int, default=20_000_000_000, help="Total tokens to collect (default 20B)")
     parser.add_argument("--seq-len", type=int, default=2048)
-    parser.add_argument("--skip-web", action="store_true", help="Skip FineWeb-Edu download")
-    parser.add_argument("--skip-code", action="store_true", help="Skip code data download")
     args = parser.parse_args()
 
     pipeline = DataPipeline(
@@ -32,20 +31,11 @@ def main():
         seq_len=args.seq_len,
     )
 
-    web_tokens = int(args.total_tokens * 0.9)
-    code_tokens = int(args.total_tokens * 0.1)
-
-    if not args.skip_web:
-        print(f"\n{'='*60}")
-        print(f"Phase 1: FineWeb-Edu ({web_tokens:,} tokens)")
-        print(f"{'='*60}\n")
-        pipeline.process_fineweb_edu(num_tokens=web_tokens)
-
-    if not args.skip_code:
-        print(f"\n{'='*60}")
-        print(f"Phase 2: StarCoderData ({code_tokens:,} tokens)")
-        print(f"{'='*60}\n")
-        pipeline.process_code_data(num_tokens=code_tokens)
+    print(f"\n{'='*60}")
+    print(f"  English Wikipedia (pre-2022 snapshot)")
+    print(f"  Target: {args.total_tokens:,} tokens")
+    print(f"{'='*60}\n")
+    pipeline.process_wikipedia(num_tokens=args.total_tokens)
 
     # Summary
     train_dir = os.path.join(args.output_dir, "train")
