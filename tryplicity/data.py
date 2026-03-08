@@ -152,8 +152,8 @@ class DataPipeline:
 
         # Full English Wikipedia — pre-2022 snapshot
         ds = load_dataset(
-            "wikipedia",
-            "20220301.en",
+            "wikimedia/wikipedia",
+            "20231101.en",
             split="train",
             streaming=True,
         )

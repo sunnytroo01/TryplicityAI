@@ -17,8 +17,8 @@ def download_sample_text(output_path: str, target_mb: int = 500):
 
     print(f"Downloading ~{target_mb}MB of Wikipedia text for tokenizer training...")
     ds = load_dataset(
-        "wikipedia",
-        "20220301.en",
+        "wikimedia/wikipedia",
+        "20231101.en",
         split="train",
         streaming=True,
     )
