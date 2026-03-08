@@ -68,6 +68,13 @@ if command -v nvidia-smi &>/dev/null; then
     export NVIDIA_TF32_OVERRIDE=1
 fi
 
+# Determine compile flag: skip on AMD (ROCm) — torch.compile has poor ROCm support
+COMPILE_FLAG="--compile"
+if command -v rocm-smi &>/dev/null; then
+    echo "  AMD GPU detected — skipping torch.compile (not stable on ROCm)"
+    COMPILE_FLAG=""
+fi
+
 # Launch: multi-GPU with torchrun, single GPU with python
 if [ "$GPU_COUNT" -gt 1 ]; then
     echo "  Multi-GPU mode: $GPU_COUNT GPUs via DDP"
@@ -75,14 +82,14 @@ if [ "$GPU_COUNT" -gt 1 ]; then
     torchrun --nproc_per_node=$GPU_COUNT \
         scripts/train.py \
         --config configs/tryplicity_350m.json \
-        --compile \
+        $COMPILE_FLAG \
         2>&1 | tee /workspace/training.log
 else
     echo "  Single GPU mode"
     echo ""
     python scripts/train.py \
         --config configs/tryplicity_350m.json \
-        --compile \
+        $COMPILE_FLAG \
         2>&1 | tee /workspace/training.log
 fi
 

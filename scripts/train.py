@@ -299,10 +299,13 @@ def main():
 
     model.forward = make_checkpointed_forward(model)
 
+    # Auto-disable torch.compile on AMD — ROCm support is unreliable
+    if args.compile and is_amd:
+        print_main(rank, "\n  WARNING: torch.compile disabled — not stable on AMD ROCm GPUs")
+        args.compile = False
+
     if args.compile:
         print_main(rank, "\n  Compiling individual layers (compatible with grad checkpointing)...")
-        # Compile individual layers instead of whole model to avoid
-        # torch.compile + torch.utils.checkpoint conflict
         for i, layer in enumerate(original_model.layers):
             original_model.layers[i] = torch.compile(layer)
         print_main(rank, f"  Compiled {len(original_model.layers)} transformer blocks")
@@ -408,7 +411,7 @@ def main():
                     fused=(not is_amd),
                 )
 
-            if args.compile:
+            if args.compile and not is_amd:
                 for i, layer in enumerate(original_model.layers):
                     original_model.layers[i] = torch.compile(layer)
 
