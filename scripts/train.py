@@ -1,25 +1,23 @@
 """
-Tryplicity pre-training — maximum efficiency edition.
+Tryplicity pre-training — AMD MI300X edition.
 
-Supports: 4x NVIDIA B200 on RunPod via DDP.
+Hardcoded for: 5x AMD Instinct MI300X on RunPod via ROCm.
 
-  Single GPU:  python scripts/train.py --config configs/tryplicity_350m.json --compile
-  Multi-GPU:   torchrun --nproc_per_node=4 scripts/train.py --config configs/tryplicity_350m.json --compile
+  Launch: bash runpod/start_training.sh
+  (or)    torchrun --nproc_per_node=5 scripts/train.py --config configs/tryplicity_350m.json
 
-Every proven efficiency technique stacked together:
-
+Efficiency stack:
   OPTIMIZER:    AdEMAMix — 95% more token-efficient than AdamW (Apple, 2024)
   SCHEDULE:     WSD (Warmup-Stable-Decay) — from MiniCPM
   PROGRESSIVE:  G_stack — start at half depth, double midway (54% speedup)
-  KERNELS:      Liger Kernel — fused ops (20% throughput + 60% memory)
-  PRECISION:    BF16 mixed precision — 2x throughput
-  ATTENTION:    FlashAttention via SDPA — O(n) memory
-  MEMORY:       Gradient checkpointing — 70% less activation memory
-  COMPILATION:  torch.compile — automatic kernel fusion
+  KERNELS:      Liger Kernel — fused ops (works on AMD via Triton)
+  PRECISION:    BF16 mixed precision
+  ATTENTION:    FlashAttention via SDPA
+  MEMORY:       Gradient checkpointing
   STABILITY:    QK-Norm, Z-loss, embedding scaling
   LEARNING:     Multi-token prediction, batch size warmup
   DATA:         Sequence packing, pre-tokenized mmap shards
-  DISTRIBUTED:  DDP for multi-GPU scaling
+  DISTRIBUTED:  DDP (5 GPUs) via RCCL
 """
 
 import os
@@ -44,15 +42,16 @@ from tryplicity.optim import AdEMAMix
 
 
 # ---------------------------------------------------------------------------
-# Distributed helpers
+# Distributed helpers (RCCL on MI300X)
 # ---------------------------------------------------------------------------
 
 def setup_distributed():
-    """Initialize DDP if launched with torchrun."""
+    """Initialize DDP via RCCL (AMD's NCCL equivalent)."""
     if "RANK" not in os.environ:
-        return 0, 0, 1  # single GPU
+        return 0, 0, 1  # single GPU fallback
 
     import torch.distributed as dist
+    # "nccl" maps to RCCL on ROCm — this is correct
     dist.init_process_group(backend="nccl")
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -143,7 +142,7 @@ def g_stack(model, config):
 
 
 def setup_liger_kernel():
-    """Try to use Liger Kernel for fused operations."""
+    """Try to use Liger Kernel (works on AMD via Triton)."""
     try:
         from liger_kernel.transformers import (
             LigerRMSNorm,
@@ -167,7 +166,7 @@ def evaluate(model, val_loader, device, max_batches=50):
         if i >= max_batches:
             break
         x, y = x.to(device), y.to(device)
-        # cache_enabled=False prevents known bug with checkpoint + autocast
+        # cache_enabled=False prevents checkpoint + autocast bug
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, cache_enabled=False):
             m = model.module if hasattr(model, "module") else model
             _, loss = m(x, y)
@@ -182,25 +181,20 @@ def evaluate(model, val_loader, device, max_batches=50):
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Train Tryplicity")
+    parser = argparse.ArgumentParser(description="Train Tryplicity (MI300X)")
     parser.add_argument("--config", type=str, default=None)
     parser.add_argument("--resume", type=str, default=None)
-    parser.add_argument("--compile", action="store_true", help="torch.compile")
     parser.add_argument("--no-progressive", action="store_true")
     parser.add_argument("--optimizer", type=str, default="ademamix", choices=["ademamix", "adamw"])
     args = parser.parse_args()
 
-    # Distributed setup
+    # Distributed setup (RCCL)
     rank, local_rank, world_size = setup_distributed()
     device = torch.device("cuda", local_rank)
 
     config = TryplicityConfig.load(args.config) if args.config else TryplicityConfig()
     torch.manual_seed(config.seed)
     torch.cuda.manual_seed(config.seed)
-
-    # Enable TF32 for NVIDIA Ampere+ (B200 = Blackwell, supports TF32)
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
 
     # GPU info
     gpu_name = torch.cuda.get_device_name(local_rank)
@@ -209,22 +203,23 @@ def main():
 
     print_main(rank, "=" * 60)
     print_main(rank, "  TRYPLICITY PRE-TRAINING")
-    print_main(rank, "  Maximum Efficiency Edition")
+    print_main(rank, "  AMD MI300X Edition")
     print_main(rank, "=" * 60)
     print_main(rank, f"\n  GPU: {gpu_name} x{world_size}")
     print_main(rank, f"  VRAM: {vram / 1024**3:.1f} GB per GPU ({vram * world_size / 1024**3:.1f} GB total)")
-    print_main(rank, f"  CUDA: {torch.version.cuda}")
+    print_main(rank, f"  Backend: ROCm (RCCL)")
     print_main(rank, f"  PyTorch: {torch.__version__}")
+    if hasattr(torch.version, 'hip'):
+        print_main(rank, f"  HIP/ROCm: {torch.version.hip}")
 
     # Efficiency stack
     liger = setup_liger_kernel()
     print_main(rank, "\n  Efficiency stack:")
-    print_main(rank, f"    Liger Kernel: {'YES' if liger.get('available') else 'not installed'}")
+    print_main(rank, f"    Liger Kernel: {'YES' if liger.get('available') else 'not installed (pip install liger-kernel)'}")
     print_main(rank, f"    FlashAttention (SDPA): YES")
     print_main(rank, f"    BF16 mixed precision: YES")
     print_main(rank, f"    Gradient checkpointing: YES")
-    print_main(rank, f"    torch.compile: {'YES' if args.compile else 'NO'}")
-    print_main(rank, f"    TF32: YES")
+    print_main(rank, f"    torch.compile: NO (not stable on ROCm)")
     print_main(rank, f"    DDP multi-GPU: {'YES (' + str(world_size) + ' GPUs)' if world_size > 1 else 'NO (single GPU)'}")
 
     # Progressive training: start at half depth
@@ -288,20 +283,13 @@ def main():
 
     model.forward = make_checkpointed_forward(model)
 
-    # torch.compile — compile individual layers (compatible with grad checkpointing)
-    if args.compile:
-        print_main(rank, "\n  Compiling individual transformer layers...")
-        for i, layer in enumerate(original_model.layers):
-            original_model.layers[i] = torch.compile(layer)
-        print_main(rank, f"  Compiled {len(original_model.layers)} transformer blocks")
-
-    # Wrap in DDP for multi-GPU
+    # Wrap in DDP with static_graph=True for gradient checkpointing compatibility
     if world_size > 1:
         from torch.nn.parallel import DistributedDataParallel as DDP
         model = DDP(model, device_ids=[local_rank], static_graph=True)
-        print_main(rank, f"  DDP initialized on {world_size} GPUs")
+        print_main(rank, f"  DDP initialized on {world_size} GPUs (static_graph=True)")
 
-    # Optimizer
+    # Optimizer (no fused=True on AMD)
     if args.optimizer == "ademamix":
         print_main(rank, f"\n  Optimizer: AdEMAMix (95% more token-efficient than AdamW)")
         optimizer = AdEMAMix(
@@ -313,13 +301,12 @@ def main():
             weight_decay=config.weight_decay,
         )
     else:
-        print_main(rank, f"\n  Optimizer: AdamW (fused)")
+        print_main(rank, f"\n  Optimizer: AdamW")
         optimizer = torch.optim.AdamW(
             original_model.parameters(),
             lr=config.learning_rate,
             betas=(0.9, 0.95),
             weight_decay=config.weight_decay,
-            fused=True,
         )
 
     # Resume
@@ -389,12 +376,7 @@ def main():
                 optimizer = torch.optim.AdamW(
                     original_model.parameters(), lr=config.learning_rate,
                     betas=(0.9, 0.95), weight_decay=config.weight_decay,
-                    fused=True,
                 )
-
-            if args.compile:
-                for i, layer in enumerate(original_model.layers):
-                    original_model.layers[i] = torch.compile(layer)
 
             # Re-wrap in DDP
             if world_size > 1:
@@ -430,7 +412,8 @@ def main():
 
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
-            # cache_enabled=False prevents known autocast + checkpoint bug
+            # cache_enabled=False prevents known bug with checkpoint + autocast
+            # (PyTorch issue #141896)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, cache_enabled=False):
                 _, loss = model(x, y)
                 loss = loss / current_accum
@@ -497,6 +480,7 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
+        # Print full traceback so torchrun actually shows the error
         print(f"\n{'='*60}", flush=True)
         print(f"FATAL ERROR on rank {os.environ.get('LOCAL_RANK', '?')}:", flush=True)
         traceback.print_exc()
